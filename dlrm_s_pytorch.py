@@ -742,7 +742,7 @@ if __name__ == "__main__":
             ngpus = torch.cuda.device_count()  # 1
         print("Using {} GPU(s)...".format(ngpus))
     elif use_ipex:
-        device = torch.device("dpcpp")
+        device = torch.device(ipex.DEVICE)
         print("Using IPEX...")
     else:
         device = torch.device("cpu")
@@ -1305,52 +1305,48 @@ if __name__ == "__main__":
                         targets = np.concatenate(targets, axis=0)
 
                         validation_results = {}
-                        if args.use_ipex:
-                            validation_results['roc_auc'], validation_results['loss'], validation_results['accuracy'] = \
-                                core.roc_auc_score(torch.from_numpy(targets).reshape(-1), torch.from_numpy(scores).reshape(-1))
-                        else:
-                            metrics = {
-                                'loss' : sklearn.metrics.log_loss,
-                                'recall' : lambda y_true, y_score:
-                                sklearn.metrics.recall_score(
-                                    y_true=y_true,
-                                    y_pred=np.round(y_score)
-                                ),
-                                'precision' : lambda y_true, y_score:
-                                sklearn.metrics.precision_score(
-                                    y_true=y_true,
-                                    y_pred=np.round(y_score)
-                                ),
-                                'f1' : lambda y_true, y_score:
-                                sklearn.metrics.f1_score(
-                                    y_true=y_true,
-                                    y_pred=np.round(y_score)
-                                ),
-                                'ap' : sklearn.metrics.average_precision_score,
-                                'roc_auc' : sklearn.metrics.roc_auc_score,
-                                'accuracy' : lambda y_true, y_score:
-                                sklearn.metrics.accuracy_score(
-                                    y_true=y_true,
-                                    y_pred=np.round(y_score)
-                                ),
-                            }
+                        metrics = {
+                            'loss' : sklearn.metrics.log_loss,
+                            'recall' : lambda y_true, y_score:
+                            sklearn.metrics.recall_score(
+                                y_true=y_true,
+                                y_pred=np.round(y_score)
+                            ),
+                            'precision' : lambda y_true, y_score:
+                            sklearn.metrics.precision_score(
+                                y_true=y_true,
+                                y_pred=np.round(y_score)
+                            ),
+                            'f1' : lambda y_true, y_score:
+                            sklearn.metrics.f1_score(
+                                y_true=y_true,
+                                y_pred=np.round(y_score)
+                            ),
+                            'ap' : sklearn.metrics.average_precision_score,
+                            'roc_auc' : sklearn.metrics.roc_auc_score,
+                            'accuracy' : lambda y_true, y_score:
+                            sklearn.metrics.accuracy_score(
+                                y_true=y_true,
+                                y_pred=np.round(y_score)
+                            ),
+                        }
 
-                            # print("Compute time for validation metric : ", end="")
-                            # first_it = True
-                            for metric_name, metric_function in metrics.items():
-                                # if first_it:
-                                #     first_it = False
-                                # else:
-                                #     print(", ", end="")
-                                # metric_compute_start = time_wrap(False)
-                                validation_results[metric_name] = metric_function(
-                                    targets,
-                                    scores
-                                )
-                                # metric_compute_end = time_wrap(False)
-                                # met_time = metric_compute_end - metric_compute_start
-                                # print("{} {:.4f}".format(metric_name, 1000 * (met_time)),
-                                #      end="")
+                        # print("Compute time for validation metric : ", end="")
+                        # first_it = True
+                        for metric_name, metric_function in metrics.items():
+                            # if first_it:
+                            #     first_it = False
+                            # else:
+                            #     print(", ", end="")
+                            # metric_compute_start = time_wrap(False)
+                            validation_results[metric_name] = metric_function(
+                                targets,
+                                scores
+                            )
+                            # metric_compute_end = time_wrap(False)
+                            # met_time = metric_compute_end - metric_compute_start
+                            # print("{} {:.4f}".format(metric_name, 1000 * (met_time)),
+                            #      end="")
 
                         # print(" ms")
                         gA_test = validation_results['accuracy']
