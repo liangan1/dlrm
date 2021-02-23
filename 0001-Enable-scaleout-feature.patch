@@ -1,0 +1,126 @@
+From 124509b04452384c0fb40942476e27c67bf7facd Mon Sep 17 00:00:00 2001
+From: rpremsee <rachithayp@users.noreply.github.com>
+Date: Mon, 12 Oct 2020 11:35:18 -0700
+Subject: [PATCH] Enable scaleout feature
+
+---
+ dlrm_s_pytorch.py     | 39 +++++++++++++++++++++++++++++++++------
+ extend_distributed.py | 27 +++++++++++++++++----------
+ 2 files changed, 50 insertions(+), 16 deletions(-)
+
+diff --git a/dlrm_s_pytorch.py b/dlrm_s_pytorch.py
+index 7f43628..b5294dd 100644
+--- a/dlrm_s_pytorch.py
++++ b/dlrm_s_pytorch.py
+@@ -244,13 +244,25 @@ class DLRM_Net(nn.Module):
+             else:
+                 # initialize embeddings
+                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
+-                W = np.random.uniform(
+-                    low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
+-                ).astype(np.float32)
++
+                 # approach 1
+                 if n >= self.sparse_dense_boundary:
+-                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
++                    # For sparse embs, split the table across ranks along sparse dimension
++                    if (ext_dist.my_size > 1) and (ext_dist.my_size > len(self.ln_emb_sparse)):
++                        new_m = m // (ext_dist.my_size // len(self.ln_emb_sparse))
++                    else:
++                        new_m = m
++
++                    W = np.random.uniform(
++                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, new_m)
++                    ).astype(np.float32)
++
++                    EE = nn.EmbeddingBag(n, new_m, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
+                 else:
++                    W = np.random.uniform(
++                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
++                    ).astype(np.float32)
++
+                     EE = nn.EmbeddingBag(n, m, mode="sum", sparse=False, _weight=torch.tensor(W, requires_grad=True))
+                 # approach 2
+                 # EE.weight.data.copy_(torch.tensor(W))
+@@ -338,7 +350,7 @@ class DLRM_Net(nn.Module):
+                 self.ln_emb_dense = [i for i in range(n_emb) if ln_emb[i] < self.sparse_dense_boundary]
+                 self.ln_emb_sparse = [i for i in range(n_emb) if ln_emb[i] >= self.sparse_dense_boundary]
+                 n_emb_sparse = len(self.ln_emb_sparse)
+-                self.n_local_emb_sparse, self.n_sparse_emb_per_rank = ext_dist.get_split_lengths(n_emb_sparse)
++                self.n_local_emb_sparse, self.n_sparse_emb_per_rank = ext_dist.get_split_lengths(n_emb_sparse, split=True)
+                 self.local_ln_emb_sparse_slice = ext_dist.get_my_slice(n_emb_sparse)
+                 self.local_ln_emb_sparse = self.ln_emb_sparse[self.local_ln_emb_sparse_slice]
+             # create operators
+@@ -476,6 +488,13 @@ class DLRM_Net(nn.Module):
+         lS_o_sparse = [lS_o[i] for i in self.ln_emb_sparse]  # partition sparse table in one group
+         lS_i_sparse = [lS_i[i] for i in self.ln_emb_sparse]
+ 
++        # Replicate the indices for sparse embs for the split grps
++        if ext_dist.my_size > len(self.ln_emb_sparse):
++            num_split_grps = ext_dist.my_size // len(self.ln_emb_sparse)
++            for j in range(num_split_grps-1):
++                for i in range(len(self.ln_emb_sparse)):
++                    lS_i_sparse.append(lS_i_sparse[i])
++
+         lS_i_sparse = ext_dist.shuffle_data(lS_i_sparse)
+         g_i_sparse = [lS_i_sparse[:, i * batch_size:(i + 1) * batch_size].reshape(-1) for i in range(len(self.local_ln_emb_sparse))]
+         offset = torch.arange(batch_size * ext_dist.my_size).to(device)
+@@ -491,7 +510,15 @@ class DLRM_Net(nn.Module):
+         # dense embeddings
+         ly_dense = self.apply_emb(lS_o_dense, lS_i_dense, self.emb_dense)
+         ly_sparse = a2a_req.wait()
+-        ly = ly_dense + list(ly_sparse)
++
++        # concat emb data for split sparse embs
++        ly_sparse_full = []
++        if ext_dist.my_size > len(self.ln_emb_sparse):
++            for i in range(len(self.ln_emb_sparse)):
++                ly_sparse_split = torch.cat([ly_sparse[j] for j in range(i, ext_dist.my_size, 16)], 1)
++                ly_sparse_full.append(ly_sparse_split)
++
++        ly = ly_dense + ly_sparse_full
+         # interactions
+         z = self.interact_features(x, ly)
+         # top mlp
+diff --git a/extend_distributed.py b/extend_distributed.py
+index 49fd661..8f51e85 100644
+--- a/extend_distributed.py
++++ b/extend_distributed.py
+@@ -28,20 +28,28 @@ def env2int(env_list, default = -1):
+     return default
+ 
+ def get_my_slice(n):
+-    my_size = dist.get_world_size()
+-    my_rank = dist.get_rank()
+-    k, m = divmod(n, my_size)
+-    return slice(my_rank * k + min(my_rank, m), (my_rank+1) * k + min(my_rank+1, m), 1)
+-
+-def get_split_lengths(n):
+-    my_size = dist.get_world_size()
+-    k, m = divmod(n, my_size)
++    grp_size = dist.get_world_size()
++    grp_rank = dist.get_rank()
++    if dist.get_world_size() > n:
++        num_split_grps = dist.get_world_size() // n
++        grp_size = dist.get_world_size() // num_split_grps
++        grp_rank = dist.get_rank() % grp_size
++    k, m = divmod(n, grp_size)
++    return slice(grp_rank * k + min(grp_rank, m), (grp_rank+1) * k + min(grp_rank+1, m), 1)
++
++def get_split_lengths(n, split=False):
++    grp_size = dist.get_world_size()
++    if split:
++        if dist.get_world_size() > n:
++            num_split_grps = dist.get_world_size() // n
++            grp_size = dist.get_world_size() // num_split_grps
++    k, m = divmod(n, grp_size)
+     if m == 0:
+         splits = None
+         my_len = k
+     else:
+         my_rank = dist.get_rank()
+-        splits = [(k+1) if i < m else k for i in range(my_size)]
++        splits = [(k+1) if i < m else k for i in range(grp_size)]
+         my_len = splits[my_rank]
+     return (my_len, splits)
+ 
